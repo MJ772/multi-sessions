@@ -9,10 +9,12 @@ import {
   age,
   clashes,
   isLive,
+  isParked,
   label,
   lastQuestion,
   needsYou,
   nextPlan,
+  parseParked,
   parsePeer,
   planSummary,
   summarizeInput,
@@ -27,6 +29,11 @@ const ME = atom(ME_REF, null)
 const PEERS = atom(PEERS_REF, [])
 const IS_OPEN = atom({ plugin: 'multi-sessions', key: 'isOpen' } as const, true)
 const DISMISSED = atom({ plugin: 'multi-sessions', key: 'dismissed' } as const, [])
+const PARKED_REF = { plugin: 'multi-sessions', key: 'parked' } as const
+const PARKED = atom(PARKED_REF, {})
+const IS_SHOWING_PARKED = atom({ plugin: 'multi-sessions', key: 'isShowingParked' } as const, false)
+// Not a heartbeat: its name does not end in .json, so the tick never reads it as a session.
+const PARKED_FILE = '_parked.txt'
 
 const TICK_MS = 3_000
 const MAX_ROWS = 8
@@ -111,6 +118,18 @@ async function openSession($: $, hostId: string) {
   await $.process.run(argv).catch(() => $.ui.toast('multi-sessions: could not open that session'))
 }
 
+// Puts a session away from every band, or brings it back. The person presses this, so two
+// sessions writing the list in the same instant is not a case worth a lock.
+async function setParked($: $, id: string, isAway: boolean) {
+  const dir = await folder($)
+  if (dir === undefined) return
+  const now = await $.clock.now()
+  const { [id]: _, ...rest } = parseParked(await $.fs.read(`${dir}/${PARKED_FILE}`).catch(() => ''))
+  const parked = isAway ? { ...rest, [id]: now } : rest
+  await $.fs.write(`${dir}/${PARKED_FILE}`, JSON.stringify(parked))
+  await $.state.set(PARKED_REF, parked)
+}
+
 async function askToPause($: $, target: Peer, clash: Clash, sender: Peer | undefined) {
   const from = sender ? `the session "${label(sender)}"` : 'another session'
   const why =
@@ -190,6 +209,9 @@ async function tick($: $) {
   run.cache = new Map(parsed.filter((r): r is readonly [string, Peer] => r[1] !== undefined))
   const others = [...run.cache.values()].filter(p => p.id !== me?.id)
   const peers = visible(me === null ? others : [{ ...me, beat: now }, ...others], now)
+  const parked = parseParked(await $.fs.read(`${dir}/${PARKED_FILE}`).catch(() => ''))
+  if (JSON.stringify(parked) !== JSON.stringify(await read($, PARKED))) await $.state.set(PARKED_REF, parked)
+  const active = peers.filter(p => !isParked(p, parked))
 
   // Redraw on a change, and once a minute so the ages move on.
   const signature = JSON.stringify([
@@ -201,14 +223,15 @@ async function tick($: $) {
     await $.state.set(PEERS_REF, peers)
   }
 
+  // A session put away raises nothing until it is back.
   const alerts = new Map<string, string>()
-  for (const p of peers) {
+  for (const p of active) {
     if (p.id !== me?.id && needsYou(p)) {
       alerts.set(`need:${p.id}:${p.since}`, `"${label(p)}" ${STATE_TEXT[p.status]}${p.need ? `: ${p.need}` : ''}`)
     }
   }
-  const byId = new Map(peers.map(p => [p.id, p]))
-  for (const c of clashes(peers, now)) {
+  const byId = new Map(active.map(p => [p.id, p]))
+  for (const c of clashes(active, now)) {
     const [a, b] = [byId.get(c.a), byId.get(c.b)]
     if (c.kind !== 'folder' && a && b && !dismissed.includes(c.key)) alerts.set(c.key, `Clash: "${label(a)}" and "${label(b)}" ${c.detail}`)
   }
@@ -227,10 +250,15 @@ async function start($: $) {
   if (run.timer !== undefined || run.isStarting) return
   run.isStarting = true
   try {
-    // Only a session a surface draws (the desktop app, a terminal) is one a person attends; a
-    // `claude -p` run has none. Right after a load the desktop surface may not be attached
-    // yet, so the next prompt, turn or tool call tries again.
-    if ((await $.session.surfaces().catch(() => [])).length === 0) return
+    // A person attends a session the desktop app hosts or a surface draws. The desktop attaches
+    // its surface only while the session is on screen, so its entrypoint counts too. A `claude -p`
+    // run from a session's Bash inherits that entrypoint, and is told apart by CHILD_SESSION.
+    const [surfaces, entry, child] = await Promise.all([
+      $.session.surfaces().catch(() => []),
+      $.env.get('CLAUDE_CODE_ENTRYPOINT'),
+      $.env.get('CLAUDE_CODE_CHILD_SESSION'),
+    ])
+    if (child === '1' || (surfaces.length === 0 && entry !== 'claude-desktop')) return
     await init($)
     run.timer = $.clock.every(TICK_MS, () => {
       if (run.isTicking) return
@@ -252,27 +280,26 @@ export const register: Register = on => {
 
   on('prompt.submit', async ($, e, next) => {
     await safe(start($))
-    const isPersons =
-      e.isMeta !== true &&
-      e.command === undefined &&
-      e.origin.kind !== 'peer' &&
-      e.origin.kind !== 'task-notification' &&
-      !e.text.trimStart().startsWith('<')
+    const isFromPerson = e.isMeta !== true && e.origin.kind !== 'peer' && e.origin.kind !== 'task-notification'
+    // A slash command or pasted markup is the person's too, but no task to show.
+    const isPersons = isFromPerson && e.command === undefined && !e.text.trimStart().startsWith('<')
     // A prompt folded into a running turn starts none.
     if (e.turnId === undefined) run.isPersonTurn = isPersons
     if (isPersons) run.heldNeed = undefined
     const result = await next(e)
-    if (result.drop !== undefined || !isPersons) return result
+    if (result.drop !== undefined || !isFromPerson) return result
     // What entered, after any hook masked it.
     const task = result.text.replace(/\s+/g, ' ').trim().slice(0, 300)
     const count = task.split(' ').length
-    // "yes" or "go with the first one" answers the task; it does not replace it.
+    const promptedAt = await $.clock.now()
     await safe(
-      update($, ME, me =>
-        me === null || count < 3 || (me.status === 'waiting' && count < 6 && me.task !== undefined)
-          ? me
-          : { ...me, task, firstAsk: me.firstAsk ?? task },
-      ),
+      update($, ME, me => {
+        if (me === null) return me
+        // "yes" or "go with the first one" answers the task; it does not replace it.
+        const isNewTask =
+          isPersons && count >= 3 && !(me.status === 'waiting' && count < 6 && me.task !== undefined)
+        return isNewTask ? { ...me, task, firstAsk: me.firstAsk ?? task, promptedAt } : { ...me, promptedAt }
+      }),
     )
 
     return result
@@ -399,27 +426,51 @@ export const register: Register = on => {
     const peers = await read($, PEERS)
     // One session alone has nothing to coordinate.
     if (e.props.hasSurvey || peers.length < 2) return next(e)
-    const [me, isOpen, dismissed, now] = await Promise.all([
+    const [me, isOpen, dismissed, now, parked, isShowingParked] = await Promise.all([
       read($, ME),
       read($, IS_OPEN),
       read($, DISMISSED),
       $.clock.now(),
+      read($, PARKED),
+      read($, IS_SHOWING_PARKED),
     ])
-    const found = clashes(peers, now).filter(c => !dismissed.includes(c.key))
-    const waiting = peers.filter(needsYou).length
-    const byId = new Map(peers.map(p => [p.id, p]))
+    const away = peers.filter(p => isParked(p, parked))
+    const active = peers.filter(p => !isParked(p, parked))
+    const found = clashes(active, now).filter(c => !dismissed.includes(c.key))
+    const waiting = active.filter(needsYou).length
+    const byId = new Map(active.map(p => [p.id, p]))
     const { Box, Text, Button } = $.ui.resolve(e)
+    // The band is one slot the mods share: draw the other mods' bands first,
+    // never in their place. Claude Code's own placeholder is never nested: the desktop drops a
+    // band that nests it.
+    const drawn = await (async () => next(e))().catch(() => null)
+    const others = drawn && typeof drawn === 'object' && (drawn as { type?: string }).type !== 'engine' ? drawn : null
 
     const header = (
       <Box key="header" flexDirection="row" gap={1}>
         <Text bold>Sessions</Text>
-        <Text dimColor>{`${peers.length} live`}</Text>
+        <Text dimColor>{`${active.length} live`}</Text>
         {waiting > 0 && <Text color="warning">{`· ${waiting} need you`}</Text>}
         {found.length > 0 && <Text color="error">{`· ${found.length} clash${found.length > 1 ? 'es' : ''}`}</Text>}
+        {isOpen && away.length > 0 && (
+          <Button
+            key="parked"
+            plain
+            label={`${away.length} done for now`}
+            onPress={() => update($, IS_SHOWING_PARKED, v => !v)}
+          />
+        )}
         <Button key="toggle" plain label={isOpen ? 'Hide' : 'Show'} onPress={() => update($, IS_OPEN, v => !v)} />
       </Box>
     )
-    if (!isOpen) return header
+    if (!isOpen) {
+      return (
+        <Box flexDirection="column">
+          {others}
+          {header}
+        </Box>
+      )
+    }
 
     const clashRow = (c: Clash) => {
       const pair = [byId.get(c.a), byId.get(c.b)].filter((p): p is Peer => p !== undefined)
@@ -478,6 +529,13 @@ export const register: Register = on => {
             {!isMe && p.hostId !== undefined && (
               <Button key={`open:${p.id}`} plain label="Open" onPress={() => openSession($, p.hostId ?? '')} />
             )}
+            <Button
+              key={`park:${p.id}`}
+              plain
+              label="Done for now"
+              // Closes the list of sessions put away too, so this one leaves the band at once.
+              onPress={() => setParked($, p.id, true).then(() => update($, IS_SHOWING_PARKED, () => false))}
+            />
           </Box>
           {detail !== undefined && (
             <Text dimColor wrap="truncate-end">{`  ${detail}`}</Text>
@@ -486,12 +544,27 @@ export const register: Register = on => {
       )
     }
 
+    const awayRow = (p: Peer) => (
+      <Box key={`away:${p.id}`} flexDirection="row" gap={1}>
+        <Text dimColor>–</Text>
+        <Box flexGrow={1} flexShrink={1}>
+          <Text dimColor wrap="truncate-end">
+            {`${p.id === me?.id ? '(this session) ' : ''}${label(p)}`}
+          </Text>
+        </Box>
+        <Text dimColor>{`${STATE_TEXT[p.status]} ${age(now - p.since)}`}</Text>
+        <Button key={`unpark:${p.id}`} plain label="Bring back" onPress={() => setParked($, p.id, false)} />
+      </Box>
+    )
+
     return (
       <Box flexDirection="column">
+        {others}
         {header}
         {found.map(clashRow)}
-        {peers.slice(0, MAX_ROWS).map(peerRow)}
-        {peers.length > MAX_ROWS && <Text dimColor>{`+${peers.length - MAX_ROWS} more`}</Text>}
+        {active.slice(0, MAX_ROWS).map(peerRow)}
+        {active.length > MAX_ROWS && <Text dimColor>{`+${active.length - MAX_ROWS} more`}</Text>}
+        {isShowingParked && away.map(awayRow)}
       </Box>
     )
   })

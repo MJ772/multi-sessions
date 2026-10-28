@@ -1,7 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 
 import type { Peer } from '../types'
-import { clashes, isSameTask, nextPlan, parsePeer, planSummary, visible } from '../hooks/logic'
+import { clashes, isParked, isSameTask, nextPlan, parseParked, parsePeer, planSummary, visible } from '../hooks/logic'
 
 const NOW = 1_800_000_000_000
 const HOST_B = 'local_11111111-2222-3333-4444-555555555555'
@@ -319,4 +319,168 @@ test('a turn the person did not start keeps the question it left open', async ($
   await clock.advance(3_000)
   expect(mine().status).toBe('waiting')
   expect(mine().need).toBe('Commit it now?')
+})
+
+// Whether a session with no surface on screen publishes its heartbeat, by its environment.
+type Body = Extract<Parameters<typeof test>[1], (...args: never[]) => unknown>
+const publishes = (env: Record<string, string>) => async (...[$, on]: Parameters<Body>) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.env(on, { USERPROFILE: 'C:/Users/T', ...env })
+  const files = new Map<string, string>()
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.surfaces', () => ({ value: [] }))
+  on('session.id', () => ({ value: 'sess-a' }))
+  on('session.cwd', () => ({ value: 'C:/repo' }))
+  on('fs.write', (_, e) => {
+    files.set(slash(e.path), e.text)
+    return { value: undefined }
+  })
+  on('fs.list', () => ({ value: [] }))
+  await $.session.start({ cwd: 'C:/repo', surface: null, isInteractive: false })
+  await clock.advance(3_000)
+
+  return files.has(`${DIR}/sess-a.json`)
+}
+
+test('a desktop session off screen publishes', async ($, on) => {
+  expect(await publishes({ CLAUDE_CODE_ENTRYPOINT: 'claude-desktop' })($, on)).toBe(true)
+})
+
+test('a claude -p child of a desktop session does not', async ($, on) => {
+  expect(await publishes({ CLAUDE_CODE_ENTRYPOINT: 'claude-desktop', CLAUDE_CODE_CHILD_SESSION: '1' })($, on)).toBe(false)
+})
+
+test('a script run through the SDK does not', async ($, on) => {
+  expect(await publishes({ CLAUDE_CODE_ENTRYPOINT: 'sdk-cli' })($, on)).toBe(false)
+})
+
+test('the band shares its slot: another mod bar still draws, above the sessions', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.env(on, { USERPROFILE: 'C:/Users/T' })
+  const files = new Map<string, string>([[`${DIR}/sess-b.json`, JSON.stringify(peer({ id: 'sess-b', title: 'Other work' }))]])
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.surfaces', () => ({ value: ['desktop'] }))
+  on('session.id', () => ({ value: 'sess-a' }))
+  on('session.cwd', () => ({ value: 'C:/repo' }))
+  on('fs.write', (_, e) => {
+    files.set(slash(e.path), e.text)
+    return { value: undefined }
+  })
+  on('fs.read', (_, e) => {
+    const text = files.get(slash(e.path))
+    if (text === undefined) throw new Error('ENOENT')
+    return { value: text }
+  })
+  on('fs.list', (_, e) => ({
+    value: [...files.keys()]
+      .filter(path => path.startsWith(`${slash(e.path)}/`))
+      .map(path => ({ name: path.slice(e.path.length + 1), kind: 'file' as const, size: 1, mtimeMs: clock.now(), isLink: false })),
+  }))
+  // Stands for another mod beneath this one in the chain, such as a progress bar.
+  on('ui.render', ($, e) => {
+    const { Text } = $.ui.resolve(e)
+    return <Text>other mod 40%</Text>
+  })
+
+  await $.session.start({ cwd: 'C:/repo', surface: 'desktop', isInteractive: false })
+  await clock.advance(3_000)
+
+  for (const surface of ['desktop', 'terminal'] as const) {
+    const ui = await $.ui.mount({ ...BAND, surface })
+    expect(await ui.find({ type: 'Text', text: /other mod 40%/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /Other work/ })).toBeDefined()
+    await ui.press({ key: 'toggle' })
+    expect(await ui.find({ type: 'Text', text: /other mod 40%/ })).toBeDefined()
+    await ui.press({ key: 'toggle' })
+    await ui.unmount()
+  }
+})
+
+test('a session put away stays away until it is prompted or needs the person', async () => {
+  const at = NOW - 60_000
+  const away = { 'sess-b': at }
+  expect(isParked(peer({ id: 'sess-b', status: 'idle', since: at - 1 }), away)).toBe(true)
+  // Working on after being put away (an approval it got, a background task) keeps it away.
+  expect(isParked(peer({ id: 'sess-b', status: 'working', since: at + 1 }), away)).toBe(true)
+  // The person prompts it again: it is back.
+  expect(isParked(peer({ id: 'sess-b', status: 'working', since: at + 1, promptedAt: at + 1 }), away)).toBe(false)
+  // Work it went on with stops on the person after it was put away: it is back.
+  expect(isParked(peer({ id: 'sess-b', status: 'approval', since: at + 1 }), away)).toBe(false)
+  expect(isParked(peer({ id: 'sess-b', status: 'question', since: at + 1 }), away)).toBe(false)
+  // A turn that ends on a question (or an automatic turn re-raising the old one) keeps it away.
+  expect(isParked(peer({ id: 'sess-b', status: 'waiting', since: at + 1 }), away)).toBe(true)
+  // It was already waiting when put away: the person chose to leave it.
+  expect(isParked(peer({ id: 'sess-b', status: 'waiting', since: at - 1 }), away)).toBe(true)
+  expect(isParked(peer({ id: 'other' }), away)).toBe(false)
+
+  expect(parseParked('nope')).toEqual({})
+  expect(parseParked('[1]')).toEqual({})
+  expect(parseParked(JSON.stringify({ 'sess-b': 5, '../x': 6, c: 'later' }))).toEqual({ 'sess-b': 5 })
+})
+
+test('Done for now hides a session from every band, and Bring back returns it', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.env(on, { USERPROFILE: 'C:/Users/T' })
+  const files = new Map<string, string>([
+    [`${DIR}/sess-b.json`, JSON.stringify(peer({ id: 'sess-b', title: 'Old work', status: 'idle', since: NOW - 600_000 }))],
+    [`${DIR}/sess-c.json`, JSON.stringify(peer({ id: 'sess-c', title: 'Other work', status: 'working' }))],
+  ])
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.surfaces', () => ({ value: ['desktop'] }))
+  on('session.id', () => ({ value: 'sess-a' }))
+  on('session.cwd', () => ({ value: 'C:/repo' }))
+  on('fs.write', (_, e) => {
+    files.set(slash(e.path), e.text)
+    return { value: undefined }
+  })
+  on('fs.read', (_, e) => {
+    const text = files.get(slash(e.path))
+    if (text === undefined) throw new Error('ENOENT')
+    return { value: text }
+  })
+  on('fs.list', (_, e) => ({
+    value: [...files.keys()]
+      .filter(path => path.startsWith(`${slash(e.path)}/`))
+      .map(path => ({ name: path.slice(e.path.length + 1), kind: 'file' as const, size: 1, mtimeMs: clock.now(), isLink: false })),
+  }))
+
+  await $.session.start({ cwd: 'C:/repo', surface: 'desktop', isInteractive: false })
+  await clock.advance(3_000)
+
+  for (const surface of ['desktop', 'terminal'] as const) {
+    const ui = await $.ui.mount({ ...BAND, surface })
+    expect(await ui.find({ type: 'Text', text: /Old work/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /3 live/ })).toBeDefined()
+
+    await ui.press({ key: 'park:sess-b' })
+    expect(await ui.find({ type: 'Text', text: /Old work/ })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: /2 live/ })).toBeDefined()
+    expect(parseParked(files.get(`${DIR}/_parked.txt`) ?? '')['sess-b']).toBeDefined()
+
+    // The count opens the list of sessions put away, each with Bring back.
+    await ui.press({ key: 'parked' })
+    expect(await ui.find({ type: 'Text', text: /Old work/ })).toBeDefined()
+    await ui.press({ key: 'unpark:sess-b' })
+    expect(parseParked(files.get(`${DIR}/_parked.txt`) ?? '')['sess-b']).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: /3 live/ })).toBeDefined()
+    // Nothing is put away now, so there is no count to press.
+    expect(await ui.find({ key: 'parked' })).toBeUndefined()
+    await ui.unmount()
+  }
+
+  // Put away again; another session's band reads the shared list on its next tick, and the
+  // session comes back on its own once the person prompts it.
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await ui.press({ key: 'park:sess-b' })
+  const parkedAt = parseParked(files.get(`${DIR}/_parked.txt`) ?? '')['sess-b'] ?? 0
+  await clock.advance(3_000)
+  expect(await ui.find({ type: 'Text', text: /Old work/ })).toBeUndefined()
+
+  files.set(
+    `${DIR}/sess-b.json`,
+    JSON.stringify(peer({ id: 'sess-b', title: 'Old work', status: 'working', since: parkedAt + 10, promptedAt: parkedAt + 10, beat: clock.now() })),
+  )
+  await clock.advance(3_000)
+  expect(await ui.find({ type: 'Text', text: /Old work/ })).toBeDefined()
+  await ui.unmount()
 })

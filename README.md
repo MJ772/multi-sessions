@@ -12,8 +12,14 @@ above the prompt, in every session, listing all your running sessions:
 
 Buttons on the band: **Open** jumps to a session (Claude desktop app),
 **Pause other** messages the other session to stop and ask you how to split
-the work, **Dismiss** hides a clash, **Hide/Show** folds the band. A toast
+the work, **Dismiss** hides a clash, **Hide/Show** folds the band.
+**Done for now** puts a session away from every band until you prompt it
+again or it stops on a permission or question; the header's
+**n done for now** lists those sessions, each with **Bring back**. A toast
 appears when another session starts needing you or a new clash shows up.
+
+The band shares its slot: any other mod's band above the prompt is drawn
+first, above this one.
 
 The band appears once two or more sessions run the mod.
 
@@ -54,6 +60,8 @@ Everything stays on your machine. The mod makes no network requests.
   closing summary of its last turn. Every session on the machine reads those
   files to draw the band. The files are not deleted; the band ignores any
   older than 12 hours.
+- **Done for now** keeps the sessions put away, each with the time it was
+  put away, in `_parked.txt` in the same folder, so every band hides them.
 - In the desktop app it reads the session's own title from the app's session
   file (under `%APPDATA%\Claude\claude-code-sessions\` on Windows,
   `~/Library/Application Support/Claude/claude-code-sessions/` on macOS).

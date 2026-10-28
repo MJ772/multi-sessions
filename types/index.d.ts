@@ -19,6 +19,8 @@ export type Peer = {
   since: number
   beat: number
   isEnded?: boolean
+  // When the person last sent it a prompt of their own: what brings a session put away back.
+  promptedAt?: number
 }
 
 export type Clash = {
@@ -36,6 +38,9 @@ declare module 'claude-code' {
       peers: Peer[]
       isOpen: boolean
       dismissed: string[]
+      // Sessions the person put away ("done for now"), by when, shared by every band.
+      parked: Record<string, number>
+      isShowingParked: boolean
     }
   }
 }

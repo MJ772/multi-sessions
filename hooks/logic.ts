@@ -16,6 +16,31 @@ export const needsYou = (p: Peer) =>
 
 export const isLive = (p: Peer, now: number) => now - p.beat < LIVE_MS
 
+// A session the person put away ("done for now") stays out of the band until they prompt it
+// again, or work it went on with stops on them (a permission, a question) after it was put away.
+// A turn that ends asking something does not count: an automatic turn re-raises the old question.
+export function isParked(p: Peer, parked: Readonly<Record<string, number>>): boolean {
+  const at = parked[p.id]
+  const isBlocked = p.status === 'approval' || p.status === 'question'
+  return at !== undefined && !((p.promptedAt ?? 0) > at) && !(isBlocked && p.since > at)
+}
+
+// The shared list of sessions put away, by when: written by whichever session's band the person
+// pressed, so read as untrusted.
+export function parseParked(text: string): Record<string, number> {
+  let raw: unknown
+  try {
+    raw = JSON.parse(text)
+  } catch {
+    return {}
+  }
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return {}
+
+  return Object.fromEntries(
+    Object.entries(raw).filter(([id, at]) => /^[\w-]{1,80}$/.test(id) && typeof at === 'number'),
+  )
+}
+
 // Live sessions, plus ones whose process went quiet while still waiting on you.
 export function visible(peers: readonly Peer[], now: number): Peer[] {
   return peers
@@ -66,6 +91,7 @@ export function parsePeer(text: string): Peer | undefined {
     since,
     beat,
     isEnded: raw.isEnded === true || undefined,
+    promptedAt: typeof raw.promptedAt === 'number' ? raw.promptedAt : undefined,
   }
 }
 
