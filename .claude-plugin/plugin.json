@@ -1,0 +1,8 @@
+{
+  "name": "multi-sessions",
+  "version": "0.1.0",
+  "description": "A band above the prompt listing every running session: its task, progress, what it needs from you, and which sessions are competing.",
+  "types": "./types/index.d.ts",
+  "author": { "name": "MJ772" },
+  "license": "MIT"
+}

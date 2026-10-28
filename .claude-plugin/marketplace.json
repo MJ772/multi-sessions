@@ -1,0 +1,11 @@
+{
+  "name": "multi-sessions",
+  "owner": { "name": "MJ772" },
+  "plugins": [
+    {
+      "name": "multi-sessions",
+      "source": "./",
+      "description": "A band above the prompt listing every running Claude Code session: its task, progress, what it needs from you, and which sessions are competing."
+    }
+  ]
+}
